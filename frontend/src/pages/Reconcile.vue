@@ -60,6 +60,7 @@ async function run() {
       <table>
         <tbody>
           <tr><th>对账范围</th><td>{{ r.detail.对账范围 }}</td></tr>
+          <tr><th>对账对象层名</th><td>{{ r.detail.对账对象层名 }}</td></tr>
           <tr><th>贴源行数</th><td>{{ r.detail.贴源行数 }}</td></tr>
           <tr><th>明细行数</th><td>{{ r.detail.明细行数 }}</td></tr>
           <tr><th>汇总行数合计</th><td>{{ r.detail.汇总行数合计 }}</td></tr>

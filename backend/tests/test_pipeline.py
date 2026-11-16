@@ -238,3 +238,147 @@ def test_reconcile_report_rows_never_carry_bypass_fields(prepared):
         assert "lane" not in r
         assert "out_count" not in r
         assert all("品类" not in k for k in r["detail"].keys() - {"对账范围"})
+
+
+# ---- 要求 5：主旁路隔离证明实体 + 按任务 id 只读接口 ----
+
+def test_isolation_proof_table_exists(client):
+    cols = _table_columns("lane_isolation_proofs")
+    assert {
+        "id",
+        "domain_id",
+        "job_id",
+        "lane",
+        "main_write_count",
+        "bypass_write_count",
+        "reconcile_layer",
+        "bypass_outcome",
+    } <= cols
+
+
+def test_main_and_bypass_jobs_each_record_isolation_proof(client, prepared):
+    main_proofs = client.get("/api/isolation-proofs/1").json()
+    assert main_proofs["通道"] == "主路径"
+    assert main_proofs["主写入数"] > 0
+    assert main_proofs["旁路写入数"] == 0
+    assert main_proofs["对账对象层名"] == "主汇总层"
+
+    ok_job = pipeline.run_detail_to_category_summary(1)
+    proof = client.get(f"/api/isolation-proofs/{ok_job['id']}").json()
+    assert proof["通道"] == "品类旁路"
+    assert proof["主写入数"] == 0
+    assert proof["旁路写入数"] == ok_job["out_count"]
+    assert proof["对账对象层名"] == "主汇总层"
+    assert proof["旁路成败"] == "成功"
+
+
+def test_bypass_failure_proof_marks_main_untouched(client, prepared):
+    main_before = _scalar("SELECT COUNT(*) FROM layer_summary WHERE domain_id=1")
+    job = pipeline.run_detail_to_category_summary(1, simulate_failure=True)
+    proof = client.get(f"/api/isolation-proofs/{job['id']}").json()
+    assert proof["旁路成败"] == "失败"
+    assert proof["主写入数"] == 0
+    assert proof["旁路写入数"] == 0
+    assert proof["对账对象层名"] == "主汇总层"
+    # 证明记录不改变主汇总层
+    assert _scalar("SELECT COUNT(*) FROM layer_summary WHERE domain_id=1") == main_before
+
+
+def test_isolation_proof_endpoint_is_read_only(client, prepared):
+    job = pipeline.run_detail_to_category_summary(1)
+    first = client.get(f"/api/isolation-proofs/{job['id']}").json()
+    second = client.get(f"/api/isolation-proofs/{job['id']}").json()
+    assert first == second
+    assert _scalar(
+        "SELECT COUNT(*) FROM lane_isolation_proofs WHERE job_id=?", (job["id"],)
+    ) == 1
+
+
+def test_isolation_proof_endpoint_404_for_unknown_job(client, prepared):
+    assert client.get("/api/isolation-proofs/999999").status_code == 404
+
+
+def test_reconcile_layer_name_never_bypass(prepared):
+    src = _code_without_docs(pipeline.run_reconcile)
+    assert "layer_summary_category" not in src
+    report = pipeline.run_reconcile(1)
+    assert report["detail"]["对账对象层名"] == "主汇总层"
+
+
+def test_proofs_never_leak_into_reconcile_report(prepared):
+    pipeline.run_detail_to_category_summary(1)
+    report = pipeline.run_reconcile(1)
+    for key in ("旁路写入数", "旁路成败", "主写入数"):
+        assert key not in report["detail"]
+        assert key not in report
+
+
+def test_dashboard_lists_isolation_proofs(client, prepared):
+    pipeline.run_detail_to_category_summary(1, simulate_failure=True)
+    dash = client.get("/api/dashboard").json()
+    proofs = dash["最近隔离证明"]
+    assert proofs
+    lanes = {p["通道"] for p in proofs}
+    assert {"主路径", "品类旁路"} <= lanes
+    assert any(p["旁路成败"] == "失败" for p in proofs)
+    # 主报告字段仍不含旁路计数
+    assert "品类旁路汇总" not in dash["分层计数"]
+
+
+def test_legacy_summary_with_category_migrates_to_store_grain(tmp_path, monkeypatch):
+    """老库主汇总表带品类列时，迁移后收敛为业务日+门店编码且不丢行。"""
+    import sqlite3
+
+    from app import seed
+
+    legacy_db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(legacy_db)
+    conn.executescript(
+        """
+        CREATE TABLE domains (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+          biz_key TEXT NOT NULL, fixture_file TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '');
+        CREATE TABLE layer_summary (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, domain_id INTEGER NOT NULL,
+          biz_day TEXT NOT NULL, store_code TEXT NOT NULL,
+          category TEXT NOT NULL DEFAULT '', amount_sum REAL NOT NULL,
+          qty_sum INTEGER NOT NULL, line_count INTEGER NOT NULL,
+          UNIQUE(domain_id, biz_day, store_code, category));
+        INSERT INTO domains(id, name, biz_key, fixture_file)
+        VALUES (1, '门店日销售', '业务日+门店编码', '门店日销售-贴源.jsonl');
+        INSERT INTO layer_summary(domain_id, biz_day, store_code, category, amount_sum, qty_sum, line_count)
+        VALUES (1, '2026-11-10', 'S01', '饮料', 120.5, 10, 1),
+               (1, '2026-11-10', 'S01', '零食', 86.0, 7, 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(seed, "connect", lambda: _legacy_connect(legacy_db))
+    seed.init_db()
+
+    conn = _legacy_connect(legacy_db)
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(layer_summary)")}
+        assert "category" not in cols
+        rows = conn.execute(
+            "SELECT biz_day, store_code, amount_sum, qty_sum, line_count FROM layer_summary"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    assert rows[0]["store_code"] == "S01"
+    assert abs(rows[0]["amount_sum"] - 206.5) < 1e-9
+    assert rows[0]["line_count"] == 2
+
+
+def _legacy_connect(db_path):
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+

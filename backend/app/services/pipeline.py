@@ -22,11 +22,71 @@ LANE_LABEL = {
 SUMMARY_GRAIN = "业务日+门店编码"
 BYPASS_GRAIN = "业务日+门店编码+品类"
 
+# 对账对象的层名：只允许主汇总层，旁路表永不出现在此
+RECONCILE_LAYER = "主汇总层"
+RECONCILE_SCOPE = "仅主汇总层（业务日+门店编码）对明细层；品类旁路表不参与对账"
+
+BYPASS_OK = "成功"
+BYPASS_FAIL = "失败"
+
 
 def _decorate_job(d: dict) -> dict:
     d["step_label"] = STEP_LABEL.get(d["step"], d["step"])
     d["lane_label"] = LANE_LABEL.get(d.get("lane", MAIN_LANE), d.get("lane", MAIN_LANE))
     return d
+
+
+def _record_isolation_proof(
+    conn,
+    domain_id: int,
+    job_id: int,
+    lane: str,
+    main_write_count: int,
+    bypass_write_count: int,
+    bypass_outcome: str,
+) -> None:
+    """登记主旁路隔离证明。每个任务恰一条，与任务同事务落库。"""
+    conn.execute(
+        """
+        INSERT INTO lane_isolation_proofs(
+          domain_id, job_id, lane, main_write_count, bypass_write_count,
+          reconcile_layer, bypass_outcome
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            domain_id,
+            job_id,
+            lane,
+            int(main_write_count),
+            int(bypass_write_count),
+            RECONCILE_LAYER,
+            bypass_outcome,
+        ),
+    )
+
+
+def get_isolation_proof(job_id: int) -> dict | None:
+    """按任务 id 只读查询隔离证明，不改变任何状态。"""
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM lane_isolation_proofs WHERE job_id=?", (job_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    return {
+        "任务编号": d["job_id"],
+        "主题域": d["domain_id"],
+        "通道": d["lane"],
+        "主写入数": d["main_write_count"],
+        "旁路写入数": d["bypass_write_count"],
+        "对账对象层名": d["reconcile_layer"],
+        "旁路成败": d["bypass_outcome"],
+        "登记时间": d["created_at"],
+    }
 
 
 def list_domains() -> list[dict]:
@@ -111,6 +171,46 @@ def list_jobs(domain_id: int | None = None, lane: str | None = None) -> list[dic
         conn.close()
 
 
+def list_isolation_proofs(domain_id: int | None = None, lane: str | None = None) -> list[dict]:
+    """隔离证明列表，供界面按通道展示；只读。"""
+    conn = connect()
+    try:
+        sql = """
+        SELECT p.* FROM lane_isolation_proofs p
+        JOIN layer_jobs j ON j.id = p.job_id
+        """
+        clauses: list[str] = []
+        args: list = []
+        if domain_id is not None:
+            clauses.append("p.domain_id=?")
+            args.append(domain_id)
+        if lane is not None:
+            clauses.append("p.lane=?")
+            args.append(lane)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY p.job_id DESC"
+        rows = conn.execute(sql, tuple(args)).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        out.append(
+            {
+                "任务编号": d["job_id"],
+                "主题域": d["domain_id"],
+                "通道": d["lane"],
+                "主写入数": d["main_write_count"],
+                "旁路写入数": d["bypass_write_count"],
+                "对账对象层名": d["reconcile_layer"],
+                "旁路成败": d["bypass_outcome"],
+                "登记时间": d["created_at"],
+            }
+        )
+    return out
+
+
 def run_paste_to_detail(domain_id: int) -> dict:
     domain = get_domain(domain_id)
     if not domain:
@@ -161,8 +261,18 @@ def run_paste_to_detail(domain_id: int) -> dict:
                 drop,
             ),
         )
-        conn.commit()
         job_id = int(cur.lastrowid)
+        # 贴源到明细属主路径，落证明：主写入数为本层产出，无旁路写入
+        _record_isolation_proof(
+            conn,
+            domain_id,
+            job_id,
+            MAIN_LANE,
+            main_write_count=out,
+            bypass_write_count=0,
+            bypass_outcome="不适用（主路径任务）",
+        )
+        conn.commit()
         return _decorate_job(
             dict(conn.execute("SELECT * FROM layer_jobs WHERE id=?", (job_id,)).fetchone())
         )
@@ -174,6 +284,7 @@ def run_detail_to_summary(domain_id: int) -> dict:
     """主路径：明细 -> 主汇总层，粒度锁定为业务日+门店编码。
 
     只写 layer_summary；品类维度不得进入汇总键，也不得写旁路表。
+    主路径与旁路任务分事务执行，旁路成败不影响本任务。
     """
     domain = get_domain(domain_id)
     if not domain:
@@ -186,13 +297,13 @@ def run_detail_to_summary(domain_id: int) -> dict:
         ).fetchall()
         buckets: dict[tuple, dict] = {}
         for row in detail:
-            key = (row["biz_day"], row["store_code"], row["category"])
+            # 主汇总键只由业务日与门店编码构成，品类维在此被收敛
+            key = (row["biz_day"], row["store_code"])
             b = buckets.setdefault(
                 key,
                 {
                     "biz_day": row["biz_day"],
                     "store_code": row["store_code"],
-                    "category": row["category"],
                     "amount": 0.0,
                     "qty": 0,
                     "n": 0,
@@ -205,14 +316,13 @@ def run_detail_to_summary(domain_id: int) -> dict:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO layer_summary(
-                  domain_id, biz_day, store_code, category, amount_sum, qty_sum, line_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                  domain_id, biz_day, store_code, amount_sum, qty_sum, line_count
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     domain_id,
                     b["biz_day"],
                     b["store_code"],
-                    b["category"],
                     b["amount"],
                     b["qty"],
                     b["n"],
@@ -226,8 +336,18 @@ def run_detail_to_summary(domain_id: int) -> dict:
             """,
             (domain_id, MAIN_LANE, f"按{SUMMARY_GRAIN}汇总（主汇总层，不含品类维）", len(detail), len(buckets)),
         )
-        conn.commit()
         job_id = int(cur.lastrowid)
+        # 主路径证明：旁路写入恒为 0，对账对象只能是主汇总层
+        _record_isolation_proof(
+            conn,
+            domain_id,
+            job_id,
+            MAIN_LANE,
+            main_write_count=len(buckets),
+            bypass_write_count=0,
+            bypass_outcome="不适用（主路径任务）",
+        )
+        conn.commit()
         return _decorate_job(
             dict(conn.execute("SELECT * FROM layer_jobs WHERE id=?", (job_id,)).fetchone())
         )
@@ -250,8 +370,19 @@ def _record_bypass_failure(domain_id: int, in_count: int, reason: str) -> int:
             """,
             (domain_id, BYPASS_LANE, reason, in_count),
         )
+        job_id = int(cur.lastrowid)
+        # 失败证明：主写入 0（旁路任务不写主汇总层）、旁路写入 0（整笔已回滚）
+        _record_isolation_proof(
+            conn,
+            domain_id,
+            job_id,
+            BYPASS_LANE,
+            main_write_count=0,
+            bypass_write_count=0,
+            bypass_outcome=BYPASS_FAIL,
+        )
         conn.commit()
-        return int(cur.lastrowid)
+        return job_id
     finally:
         conn.close()
 
@@ -342,13 +473,22 @@ def run_detail_to_category_summary(domain_id: int, simulate_failure: bool = Fals
             """,
             (domain_id, BYPASS_LANE, f"按{BYPASS_GRAIN}写入独立旁路表（不参与主对账）", in_count, inserted),
         )
-        conn.commit()
         job_id = int(cur.lastrowid)
+        # 成功证明：旁路写入仅落在旁路表，主写入为 0，对账对象仍是主汇总层
+        _record_isolation_proof(
+            conn,
+            domain_id,
+            job_id,
+            BYPASS_LANE,
+            main_write_count=0,
+            bypass_write_count=inserted,
+            bypass_outcome=BYPASS_OK,
+        )
+        conn.commit()
         return _get_job(job_id)
     except Exception as exc:
+        # 失败只回滚本连接上的旁路事务，绝不触碰主汇总层
         conn.rollback()
-        conn.execute("DELETE FROM layer_summary WHERE domain_id=?", (domain_id,))
-        conn.commit()
         conn.close()
         reason = f"品类旁路任务失败，旁路写入已全部回滚；主汇总层与主路径任务不受影响。原因：{exc}"
         job_id = _record_bypass_failure(domain_id, in_count, reason)
@@ -379,7 +519,10 @@ def run_reconcile(domain_id: int) -> dict:
             ).fetchone()["c"]
         )
         summary = conn.execute(
-            "SELECT COALESCE(SUM(line_count),0) AS s, COALESCE(SUM(amount_sum),0) AS a FROM layer_summary_category WHERE domain_id=?",
+            """
+            SELECT COALESCE(SUM(line_count),0) AS s, COALESCE(SUM(amount_sum),0) AS a
+            FROM layer_summary WHERE domain_id=?
+            """,
             (domain_id,),
         ).fetchone()
         summary_line_sum = int(summary["s"])
@@ -394,7 +537,8 @@ def run_reconcile(domain_id: int) -> dict:
         amount_drift = round(summary_amount - detail_amount, 4)
         status = "一致" if key_mismatch == 0 and abs(amount_drift) < 0.0001 else "存在差异"
         detail = {
-            "对账范围": "仅主汇总层（业务日+门店编码）对明细层；品类旁路表不参与对账",
+            "对账范围": RECONCILE_SCOPE,
+            "对账对象层名": RECONCILE_LAYER,
             "贴源行数": paste_count,
             "明细行数": detail_count,
             "汇总行数合计": summary_line_sum,
@@ -457,10 +601,12 @@ def dashboard() -> dict:
     main_jobs = [j for j in all_jobs if j.get("lane", MAIN_LANE) == MAIN_LANE][:5]
     bypass_jobs = [j for j in all_jobs if j.get("lane") == BYPASS_LANE][:5]
     reports = list_reconcile()[:5]
+    proofs = list_isolation_proofs()[:5]
     return {
         "主题域数": len(domains),
         "分层计数": counts,
         "旁路计数": {"品类旁路汇总": bypass_count},
+        "最近隔离证明": proofs,
         "最近任务": [
             {
                 "编号": j["id"],

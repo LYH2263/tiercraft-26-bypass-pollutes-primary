@@ -107,6 +107,31 @@ function statusClass(status) {
         </table>
         <p v-else class="muted">暂无对账报告。</p>
       </div>
+
+      <div class="panel proof-panel">
+        <h3>主旁路隔离证明（按任务登记）</h3>
+        <table v-if="data.最近隔离证明.length">
+          <thead>
+            <tr>
+              <th>任务编号</th><th>通道</th><th>主写入数</th><th>旁路写入数</th>
+              <th>对账对象层名</th><th>旁路成败</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="p in data.最近隔离证明" :key="p.任务编号">
+              <td>{{ p.任务编号 }}</td>
+              <td><span :class="['lane-tag', p.通道 === '品类旁路' ? 'lane-bypass' : 'lane-main']">{{ p.通道 }}</span></td>
+              <td>{{ p.主写入数 }}</td>
+              <td>{{ p.旁路写入数 }}</td>
+              <td>{{ p.对账对象层名 }}</td>
+              <td :class="p.旁路成败 === '失败' ? 'fail' : (p.旁路成败 === '成功' ? 'ok' : 'muted')">
+                {{ p.旁路成败 }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="muted">暂无隔离证明，跑一次主路径或旁路任务后自动登记。</p>
+      </div>
     </template>
   </div>
 </template>

@@ -5,11 +5,16 @@ import { getJson, postJson } from '../api'
 const domains = ref([])
 const domainId = ref(1)
 const jobs = ref([])
+const proofs = ref([])
 const err = ref('')
 const busy = ref(false)
+const activeJobId = ref(null)
+const activeProof = ref(null)
 
 async function refresh() {
   jobs.value = await getJson(`/api/jobs?domain_id=${domainId.value}`)
+  proofs.value = await getJson(`/api/isolation-proofs?domain_id=${domainId.value}`)
+  if (activeJobId.value !== null) await showProof(activeJobId.value)
 }
 
 onMounted(async () => {
@@ -39,6 +44,20 @@ const runPasteToDetail = () => call('/api/jobs/paste-to-detail')
 const runMainSummary = () => call('/api/jobs/detail-to-summary')
 const runBypass = (simulateFailure = false) =>
   call('/api/jobs/detail-to-category-summary', { simulate_failure: simulateFailure })
+
+async function showProof(jobId) {
+  activeJobId.value = jobId
+  try {
+    activeProof.value = await getJson(`/api/isolation-proofs/${jobId}`)
+  } catch (e) {
+    activeProof.value = null
+    err.value = String(e.message || e)
+  }
+}
+
+function proofFor(jobId) {
+  return proofs.value.find((p) => p.任务编号 === jobId)
+}
 
 function laneClass(lane) {
   return lane === '品类旁路' ? 'lane-bypass' : 'lane-main'
@@ -88,7 +107,7 @@ function statusClass(status) {
         <thead>
           <tr>
             <th>编号</th><th>通道</th><th>步骤</th><th>状态</th><th>说明</th>
-            <th>输入</th><th>写入</th><th>剔除</th><th>时间</th>
+            <th>输入</th><th>写入</th><th>剔除</th><th>时间</th><th>隔离证明</th>
           </tr>
         </thead>
         <tbody>
@@ -102,10 +121,43 @@ function statusClass(status) {
             <td>{{ j.out_count }}</td>
             <td>{{ j.drop_count }}</td>
             <td>{{ j.created_at }}</td>
+            <td>
+              <button class="secondary small-btn" @click="showProof(j.id)">查看证明</button>
+              <span
+                v-if="proofFor(j.id)"
+                :class="['small', proofFor(j.id).旁路成败 === '失败' ? 'fail' : 'muted']"
+              >
+                · {{ proofFor(j.id).旁路成败 }}
+              </span>
+            </td>
           </tr>
         </tbody>
       </table>
       <p v-if="!jobs.length" class="muted">还没有任务记录。</p>
     </div>
+
+    <div v-if="activeProof" class="panel proof-panel">
+      <h3>
+        主旁路隔离证明 · 任务 {{ activeProof.任务编号 }}
+        <span :class="['lane-tag', laneClass(activeProof.通道)]">{{ activeProof.通道 }}</span>
+      </h3>
+      <table>
+        <tbody>
+          <tr><th>主写入数</th><td>{{ activeProof.主写入数 }}</td></tr>
+          <tr><th>旁路写入数</th><td>{{ activeProof.旁路写入数 }}</td></tr>
+          <tr><th>对账对象层名</th><td>{{ activeProof.对账对象层名 }}</td></tr>
+          <tr>
+            <th>旁路成败</th>
+            <td :class="activeProof.旁路成败 === '失败' ? 'fail' : 'ok'">{{ activeProof.旁路成败 }}</td>
+          </tr>
+          <tr><th>登记时间</th><td>{{ activeProof.登记时间 }}</td></tr>
+        </tbody>
+      </table>
+      <p class="muted small">
+        旁路写入只落在独立旁路表，主写入数与旁路写入数分列展示；对账对象固定为主汇总层，
+        旁路成败不参与主对账结论。
+      </p>
+    </div>
+    <p v-else-if="activeJobId !== null" class="muted">该任务暂无隔离证明。</p>
   </div>
 </template>

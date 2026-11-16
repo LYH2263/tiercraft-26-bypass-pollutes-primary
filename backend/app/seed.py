@@ -41,16 +41,16 @@ CREATE TABLE IF NOT EXISTS layer_detail (
   FOREIGN KEY(domain_id) REFERENCES domains(id)
 );
 
+-- 主汇总表：粒度锁定为业务日+门店编码，不含品类列；对账唯一汇总来源
 CREATE TABLE IF NOT EXISTS layer_summary (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   domain_id INTEGER NOT NULL,
   biz_day TEXT NOT NULL,
   store_code TEXT NOT NULL,
-  category TEXT NOT NULL DEFAULT '',
   amount_sum REAL NOT NULL,
   qty_sum INTEGER NOT NULL,
   line_count INTEGER NOT NULL,
-  UNIQUE(domain_id, biz_day, store_code, category),
+  UNIQUE(domain_id, biz_day, store_code),
   FOREIGN KEY(domain_id) REFERENCES domains(id)
 );
 
@@ -82,6 +82,22 @@ CREATE TABLE IF NOT EXISTS layer_jobs (
   FOREIGN KEY(domain_id) REFERENCES domains(id)
 );
 
+-- 主旁路隔离证明：随每次主路径/旁路任务落一条，记录主写入数、旁路写入数、
+-- 对账对象层名与旁路成败；只由对应任务写，供只读接口按任务 id 查询。
+CREATE TABLE IF NOT EXISTS lane_isolation_proofs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain_id INTEGER NOT NULL,
+  job_id INTEGER NOT NULL UNIQUE,
+  lane TEXT NOT NULL,
+  main_write_count INTEGER NOT NULL DEFAULT 0,
+  bypass_write_count INTEGER NOT NULL DEFAULT 0,
+  reconcile_layer TEXT NOT NULL,
+  bypass_outcome TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(domain_id) REFERENCES domains(id),
+  FOREIGN KEY(job_id) REFERENCES layer_jobs(id)
+);
+
 CREATE TABLE IF NOT EXISTS reconcile_reports (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   domain_id INTEGER NOT NULL,
@@ -105,16 +121,65 @@ def _migrate(conn) -> None:
         conn.execute(
             "ALTER TABLE layer_jobs ADD COLUMN lane TEXT NOT NULL DEFAULT '主路径'"
         )
+    # 老库的主汇总表若带品类列，重建为业务日+门店编码粒度，并把旧行按新键收敛保留
+    summary_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(layer_summary)").fetchall()
+    }
+    if "category" in summary_cols:
+        legacy = conn.execute(
+            """
+            SELECT s.domain_id, s.biz_day, s.store_code,
+                   SUM(s.amount_sum) AS amount_sum, SUM(s.qty_sum) AS qty_sum,
+                   SUM(s.line_count) AS line_count
+            FROM layer_summary s
+            JOIN domains d ON d.id = s.domain_id
+            GROUP BY s.domain_id, s.biz_day, s.store_code
+            """
+        ).fetchall()
+        conn.execute("DROP TABLE layer_summary")
+        conn.execute(
+            """
+            CREATE TABLE layer_summary (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              domain_id INTEGER NOT NULL,
+              biz_day TEXT NOT NULL,
+              store_code TEXT NOT NULL,
+              amount_sum REAL NOT NULL,
+              qty_sum INTEGER NOT NULL,
+              line_count INTEGER NOT NULL,
+              UNIQUE(domain_id, biz_day, store_code),
+              FOREIGN KEY(domain_id) REFERENCES domains(id)
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO layer_summary(domain_id, biz_day, store_code, amount_sum, qty_sum, line_count)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    r["domain_id"],
+                    r["biz_day"],
+                    r["store_code"],
+                    r["amount_sum"],
+                    r["qty_sum"],
+                    r["line_count"],
+                )
+                for r in legacy
+            ],
+        )
 
 
 def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
-        _migrate(conn)
         row = conn.execute("SELECT COUNT(*) AS c FROM domains").fetchone()
         if int(row["c"]) == 0:
             _seed_domain(conn)
+        # 先备好主题域再迁移，保证重建表时的外键目标存在
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()
